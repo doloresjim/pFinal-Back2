@@ -1,4 +1,3 @@
-//SERVIDOR 1
 const express = require("express");
 const admin = require("firebase-admin");
 const cors = require("cors");
@@ -6,38 +5,50 @@ const bodyParser = require("body-parser");
 const winston = require("winston");
 const jwt = require("jsonwebtoken");
 const speakeasy = require("speakeasy");
-const bcrypt = require("bcryptjs");  // Se agregó bcrypt
-const rateLimit = require("express-rate-limit"); // Se corrigió importación
-require("dotenv").config(); 
+const bcrypt = require("bcryptjs");
+require("dotenv").config();
+const rateLimit = require('express-rate-limit'); 
+
+// Configuración global de orígenes permitidos
+const allowedOrigins = [
+  'https://front-p-final-1ds7.vercel.app',
+  'https://front-p-final-chi.vercel.app',
+  'http://localhost:3000'
+];
 
 const { SECRET_KEY } = process.env;
-const PORT = 5002;
-
+const PORT = process.env.PORT || 5002;
+ 
 const limiter = rateLimit({
-  windowMs: 10 * 60 * 1000, 
-  max: 100,
-  message: "Too many requests from this IP, please try again later.",
-  handler: (req, res) => {
+  windowMs: 10 * 60 * 1000, // 10 minutos
+  max: 100, // Límite por IP
+  standardHeaders: true, // Headers estándar (RFC 6585)
+  legacyHeaders: false, // Desactiva headers obsoletos
+  skipSuccessfulRequests: false, // Cuenta todas las peticiones
+  handler: (req, res, next) => {
     const logData = {
       timestamp: new Date(),
       method: req.method,
       url: req.url,
-      status: 429, // 🟡 Mantiene el código 429
-      responseTime: Date.now() - req.startTime,
-      ip: req.ip || req.connection.remoteAddress,
-      userAgent: req.get("User-Agent"),
-      server: 2, 
+      status: 429,
+      ip: req.ip,
+      userAgent: req.get('User-Agent'),
+      message: 'Rate limit exceeded'
     };
-
-    logger.error(logData); // 🔴 Lo guarda en logs como error aunque sea 429
-    db.collection("logs").add(logData).catch(err => console.error("Error guardando log en Firebase:", err));
-
-    res.status(429).json({ message: "Too many requests from this IP, please try again later." });
-  },
+    
+    logger.warn(logData); // Usa WARN en lugar de ERROR para límites
+    db.collection("rateLimitLogs").add(logData).catch(console.error);
+    
+    res.status(429).json({
+      error: "Too many requests",
+      message: "Límite de 100 peticiones cada 10 minutos excedido",
+      retryAfter: `${Math.ceil(req.rateLimit.resetTime - Date.now()) / 1000}s`
+    });
+  }
 });
 
-
-const serviceAccount = require("./configs/serviceAccountKey.json");
+// Configuración de Firebase
+const serviceAccount = JSON.parse(process.env.FIREBASE_CREDENTIALS);
 
 if (!admin.apps.length) {
   admin.initializeApp({
@@ -51,174 +62,205 @@ const routes = require("./routes");
 const server = express();
 const db = admin.firestore();
 
-server.use(cors({ origin: "http://localhost:3000", credentials: true }));
-server.use(bodyParser.json());
-server.use(limiter); // Se agregó limitador de solicitudes
+// Middleware CORS manual mejorado
+server.use((req, res, next) => {
+  const origin = req.headers.origin;
+  
+  if (allowedOrigins.includes(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.setHeader('Vary', 'Origin');
+  }
 
-// Configuración de winston para logs
+  if (req.method === 'OPTIONS') {
+    return res.status(200).end();
+  }
+  
+  next();
+});
+
+server.use(bodyParser.json());
+server.use(limiter);
+
+// Configuración de logs con Winston
 const logger = winston.createLogger({
   level: "info",
-  format: winston.format.json(),
+  format: winston.format.combine(
+    winston.format.timestamp(),
+    winston.format.json()
+  ),
   transports: [
     new winston.transports.File({ filename: "logs/error.log", level: "error" }),
-    new winston.transports.File({ filename: "logs/all.log", level: "info" }),
-    new winston.transports.File({ filename: "logs/combined.log" }),
+    new winston.transports.File({ filename: "logs/combined.log" })
   ],
 });
 
-// Middleware de logging
+// Middleware de logging mejorado
 server.use(async (req, res, next) => {
-  console.log(`📡 [${req.method}] ${req.url} - Body:`, req.body);
   const startTime = Date.now();
 
   res.on("finish", async () => {
     const logData = {
-      timestamp: new Date(),  // Cambié 'marcaDeTiempo' por 'timestamp'
+      timestamp: new Date(),
       method: req.method,
       url: req.url,
       status: res.statusCode,
       responseTime: Date.now() - startTime,
       ip: req.ip || req.connection.remoteAddress,
       userAgent: req.get("User-Agent"),
-      server: 2,   
+      origin: req.headers.origin,
+      corsHeaders: {
+        'access-control-allow-origin': res.getHeader('access-control-allow-origin'),
+        'access-control-allow-credentials': res.getHeader('access-control-allow-credentials')
+      }
     };
 
-    if(res.statusCode >= 400) {
+    if (res.statusCode >= 400) {
       logger.error(logData);
-    }else{
+    } else {
       logger.info(logData);
     }
 
     try {
       await db.collection("logs").add(logData);
     } catch (error) {
-      logger.error("Error al guardar log en Firebase: ", error);
+      logger.error("Error al guardar log en Firebase:", error);
     }
   });
 
   next();
 });
 
-
-// Rutas de la API
+// Rutas principales
 server.use("/api", routes);
 
-// 🔑 Endpoint de login
+// Endpoint de login
 server.post("/login", async (req, res) => {
-  const { email, password } = req.body;
-
-  if (!email || !password) {
-    return res.status(400).json({ message: "Faltan datos" });
-  }
-
   try {
-    const userDoc = await db.collection("users").where("email", "==", email).get();
+    const { email, password } = req.body;
+    
+    if (!email || !password) {
+      return res.status(400).json({ message: "Email y contraseña son requeridos" });
+    }
 
-    if (userDoc.empty) {
+    const userSnapshot = await db.collection("users").where("email", "==", email).get();
+    
+    if (userSnapshot.empty) {
       return res.status(401).json({ message: "Credenciales inválidas" });
     }
 
-    const doc = userDoc.docs[0];
-    const user = doc.data();
-    const userId = doc.id; // Obtener el ID del documento
+    const userDoc = userSnapshot.docs[0];
+    const user = userDoc.data();
 
     const isMatch = await bcrypt.compare(password, user.password);
-
     if (!isMatch) {
       return res.status(401).json({ message: "Credenciales inválidas" });
     }
 
-    // Retorna si se requiere MFA (ajusta según la lógica de tu app)
-    res.json({ requiresMFA: true, userId });
+    res.json({ 
+      requiresMFA: true, 
+      userId: userDoc.id 
+    });
 
   } catch (error) {
-    console.error("Error en login:", error);
+    logger.error("Error en login:", error);
     res.status(500).json({ message: "Error interno del servidor" });
   }
 });
 
-// 🔑 Endpoint de verificación de OTP
+// Endpoint de verificación OTP
 server.post("/verify-otp", async (req, res) => {
-  const { email, token } = req.body; 
-
   try {
-    const userDoc = await db.collection("users").where("email", "==", email).get();
-    if (userDoc.empty) {
+    const { email, token } = req.body;
+    
+    const userSnapshot = await db.collection("users").where("email", "==", email).get();
+    
+    if (userSnapshot.empty) {
       return res.status(404).json({ message: "Usuario no encontrado" });
     }
-    
-    const user = userDoc.docs[0].data(); 
 
+    const user = userSnapshot.docs[0].data();
     const verified = speakeasy.totp.verify({
       secret: user.mfaSecret,
       encoding: "base32",
       token,
       window: 1,
-    }); 
-
-    if (verified) {
-      res.json({ success: true });
-    } else {
-      res.status(401).json({ success: false });
-    }
-  } catch (error) {
-    console.error("Error en OTP:", error);
-    res.status(500).json({ message: "Error interno del servidor" });
-  }
-});
-
-// 🔑 Endpoint de alumno
-server.get("/getInfo", async (req, res) => {
-  const { idUs } = req.query;
-  try {
-    const userDoc = await db.collection('users').doc(idUs).get();
-
-    if (!userDoc.exists) {
-      return res.status(401).json({ message: "Usuario no encontrado" });
-    }
-
-    const userData = userDoc.data(); 
-    return res.status(200).json({
-      statusCode: 200,
-      message: "Usuario encontrado exitosamente.",
-      user: userData
-  }); 
-     
-
-  } catch (error) {
-    console.error("Error en getInfo:", error);
-    res.status(500).json({ message: "Error interno del servidor" });
-  }
-});
-
-
-// 🔑 Endpoint de servidor
-server.get("/getServer", async (req, res) => { 
-  try {
-    const logCollection = await db.collection("logs").get();
-
-    if (logCollection.empty) {
-      return res.status(404).json({ message: "No se encontraron logs" });
-    }
-    
-    // Convertir los documentos en un arreglo
-    const logs = logCollection.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-
-    return res.status(200).json({
-      statusCode: 200,
-      message: "Logs obtenidos exitosamente.",
-      logs // Enviamos los documentos en un arreglo
     });
-     
+
+    res.json({ success: verified });
 
   } catch (error) {
-    console.error("Error en getServer:", error);
+    logger.error("Error en verificación OTP:", error);
     res.status(500).json({ message: "Error interno del servidor" });
   }
 });
 
+// Endpoint para obtener información de usuario
+server.get("/getInfo", async (req, res) => {
+  try {
+    const { idUs } = req.query;
+    
+    if (!idUs) {
+      return res.status(400).json({ message: "ID de usuario es requerido" });
+    }
 
-// 🔥 Iniciar servidor
+    const userDoc = await db.collection("users").doc(idUs).get();
+    
+    if (!userDoc.exists) {
+      return res.status(404).json({ message: "Usuario no encontrado" });
+    }
+
+    res.json({
+      statusCode: 200,
+      message: "Usuario encontrado",
+      user: userDoc.data()
+    });
+
+  } catch (error) {
+    logger.error("Error en getInfo:", error);
+    res.status(500).json({ message: "Error interno del servidor" });
+  }
+});
+
+// Endpoint para obtener logs del servidor
+server.get("/getServer", async (req, res) => {
+  try {
+    const logsSnapshot = await db.collection("logs").get();
+    const logs = logsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    
+    res.json({
+      statusCode: 200,
+      message: "Logs obtenidos",
+      logs
+    });
+
+  } catch (error) {
+    logger.error("Error en getServer:", error);
+    res.status(500).json({ message: "Error interno del servidor" });
+  }
+});
+
+// Middleware para manejar errores CORS explícitamente
+server.use((err, req, res, next) => {
+  if (err.message === 'Not allowed by CORS') {
+    res.status(403).json({ 
+      statusCode: 403,
+      message: 'Origen no permitido',
+      allowedOrigins,
+      yourOrigin: req.headers.origin
+    });
+  } else {
+    next(err);
+  }
+});
+
+// Iniciar servidor
 server.listen(PORT, () => {
   console.log(`Servidor corriendo en http://localhost:${PORT}`);
+  console.log('Orígenes permitidos:', allowedOrigins);
 });
+
+// Exportar para testing
+module.exports = server;
