@@ -9,16 +9,17 @@ const bcrypt = require("bcryptjs");
 require("dotenv").config();
 const rateLimit = require('express-rate-limit'); 
 
-// Configuración global de orígenes permitidos
 const allowedOrigins = [
   'https://front-p-final-1ds7.vercel.app',
   'https://front-p-final-chi.vercel.app',
+  'https://front-p-final-l0liz.vercel.app',
   'http://localhost:3000'
 ];
 
+
 const { SECRET_KEY } = process.env;
 const PORT = process.env.PORT || 5002;
- 
+
 const limiter = rateLimit({
   windowMs: 10 * 60 * 1000, // 10 minutos
   max: 100, // Límite por IP
@@ -47,6 +48,7 @@ const limiter = rateLimit({
   }
 });
 
+
 // Configuración de Firebase
 const serviceAccount = JSON.parse(process.env.FIREBASE_CREDENTIALS);
 
@@ -58,33 +60,32 @@ if (!admin.apps.length) {
   admin.app();
 }
 
-const routes = require("./routes");
 const server = express();
 const db = admin.firestore();
-
-// Middleware CORS manual mejorado
-server.use((req, res, next) => {
-  const origin = req.headers.origin;
-  
-  if (allowedOrigins.includes(origin)) {
-    res.setHeader('Access-Control-Allow-Origin', origin);
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
-    res.setHeader('Access-Control-Allow-Credentials', 'true');
-    res.setHeader('Vary', 'Origin');
-  }
-
-  if (req.method === 'OPTIONS') {
-    return res.status(200).end();
-  }
-  
-  next();
-});
+const routes = require("./routes");
 
 server.use(bodyParser.json());
+server.use(bodyParser.urlencoded({ extended: true }));
 server.use(limiter);
 
-// Configuración de logs con Winston
+const corsOptions = {
+  origin: function (origin, callback) {
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      console.warn(`Intento de acceso desde origen no permitido: ${origin}`);
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-action-type'],
+  credentials: true,
+  optionsSuccessStatus: 200
+};
+
+server.use(cors(corsOptions));
+server.options('*', cors(corsOptions));
+
 const logger = winston.createLogger({
   level: "info",
   format: winston.format.combine(
@@ -97,56 +98,62 @@ const logger = winston.createLogger({
   ],
 });
 
-// Middleware de logging mejorado
-server.use(async (req, res, next) => {
+// Middleware
+server.use((req, res, next) => {
   const startTime = Date.now();
+  const shouldLog = req.method === "GET" || req.method === "POST";
 
-  res.on("finish", async () => {
+  const originalJson = res.json.bind(res);
+  const originalSend = res.send.bind(res);
+
+  const logResponse = async (body, methodUsed) => {
     const logData = {
-      timestamp: new Date(),
+      timestamp: new Date(),  // Cambié 'marcaDeTiempo' por 'timestamp'
       method: req.method,
       url: req.url,
       status: res.statusCode,
       responseTime: Date.now() - startTime,
       ip: req.ip || req.connection.remoteAddress,
       userAgent: req.get("User-Agent"),
-      origin: req.headers.origin,
-      corsHeaders: {
-        'access-control-allow-origin': res.getHeader('access-control-allow-origin'),
-        'access-control-allow-credentials': res.getHeader('access-control-allow-credentials')
-      }
+      server: 1,
     };
 
-    if (res.statusCode >= 400) {
-      logger.error(logData);
-    } else {
-      logger.info(logData);
+    try {
+      if (shouldLog) {
+        await db.collection("logs").add(logData);
+
+        if (res.statusCode >= 400) {
+          logger.error(logData);
+        } else {
+          logger.info(logData);
+        }
+      }
+    } catch (error) {
+      console.error("Error al guardar logs:", error);
     }
 
-    try {
-      await db.collection("logs").add(logData);
-    } catch (error) {
-      logger.error("Error al guardar log en Firebase:", error);
-    }
-  });
+    return methodUsed(body);
+  };
+
+  res.json = (body) => logResponse(body, originalJson);
+  res.send = (body) => logResponse(body, originalSend);
 
   next();
 });
 
-// Rutas principales
+// Rutas de la API
 server.use("/api", routes);
 
-// Endpoint de login
+// LOGIN
 server.post("/login", async (req, res) => {
   try {
     const { email, password } = req.body;
-    
+
     if (!email || !password) {
       return res.status(400).json({ message: "Email y contraseña son requeridos" });
     }
 
     const userSnapshot = await db.collection("users").where("email", "==", email).get();
-    
     if (userSnapshot.empty) {
       return res.status(401).json({ message: "Credenciales inválidas" });
     }
@@ -159,10 +166,7 @@ server.post("/login", async (req, res) => {
       return res.status(401).json({ message: "Credenciales inválidas" });
     }
 
-    res.json({ 
-      requiresMFA: true, 
-      userId: userDoc.id 
-    });
+    res.json({ requiresMFA: true, userId: userDoc.id });
 
   } catch (error) {
     logger.error("Error en login:", error);
@@ -170,13 +174,12 @@ server.post("/login", async (req, res) => {
   }
 });
 
-// Endpoint de verificación OTP
+// OTP VERIFICATION
 server.post("/verify-otp", async (req, res) => {
   try {
     const { email, token } = req.body;
-    
+
     const userSnapshot = await db.collection("users").where("email", "==", email).get();
-    
     if (userSnapshot.empty) {
       return res.status(404).json({ message: "Usuario no encontrado" });
     }
@@ -197,17 +200,92 @@ server.post("/verify-otp", async (req, res) => {
   }
 });
 
-// Endpoint para obtener información de usuario
+// NUEVA RECUPERACIÓN CON CODIGO
+server.post("/request-password-reset", async (req, res) => {
+  try {
+    const { email } = req.body;
+
+    if (!email) {
+      return res.status(400).json({ message: "Email es requerido" });
+    }
+
+    const userSnapshot = await db.collection("users").where("email", "==", email).get();
+    if (userSnapshot.empty) {
+      return res.status(200).json({ 
+        message: "Si el email existe, podrás usar el código para restablecer tu contraseña",
+        success: false 
+      });
+    }
+
+    const userDoc = userSnapshot.docs[0];
+    const user = userDoc.data();
+
+    const resetToken = jwt.sign({ userId: userDoc.id }, SECRET_KEY, { expiresIn: '15m' });
+
+    res.status(200).json({ 
+      message: "Usa el código del autenticador para continuar.",
+      resetToken,
+      mfaSecret: user.mfaSecret,
+      success: true
+    });
+
+  } catch (error) {
+    console.error("Error en request-password-reset:", error);
+    res.status(500).json({ message: "Error en el servidor" });
+  }
+});
+
+// RESTABLECER CONTRASEÑA
+server.post("/reset-password", async (req, res) => {
+  try {
+    const { resetToken, mfaCode, newPassword } = req.body;
+
+    if (!resetToken || !mfaCode || !newPassword) {
+      return res.status(400).json({ message: "Todos los campos son requeridos" });
+    }
+
+    const decoded = jwt.verify(resetToken, SECRET_KEY);
+    const userDoc = await db.collection("users").doc(decoded.userId).get();
+
+    if (!userDoc.exists) {
+      return res.status(404).json({ message: "Usuario no encontrado" });
+    }
+
+    const user = userDoc.data();
+
+    const verified = speakeasy.totp.verify({
+      secret: user.mfaSecret,
+      encoding: "base32",
+      token: mfaCode,
+      window: 1
+    });
+
+    if (!verified) {
+      return res.status(401).json({ message: "Código MFA inválido" });
+    }
+
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+    await db.collection("users").doc(decoded.userId).update({ password: hashedPassword });
+
+    res.json({ message: "Contraseña actualizada correctamente" });
+
+  } catch (error) {
+    logger.error("Error en reset-password:", error);
+    res.status(500).json({ message: "Error interno del servidor" });
+  }
+});
+
+// INFO DE USUARIO
 server.get("/getInfo", async (req, res) => {
   try {
     const { idUs } = req.query;
-    
+
     if (!idUs) {
       return res.status(400).json({ message: "ID de usuario es requerido" });
     }
 
     const userDoc = await db.collection("users").doc(idUs).get();
-    
+
     if (!userDoc.exists) {
       return res.status(404).json({ message: "Usuario no encontrado" });
     }
@@ -224,12 +302,12 @@ server.get("/getInfo", async (req, res) => {
   }
 });
 
-// Endpoint para obtener logs del servidor
+// LOGS DEL SERVIDOR
 server.get("/getServer", async (req, res) => {
   try {
     const logsSnapshot = await db.collection("logs").get();
     const logs = logsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-    
+
     res.json({
       statusCode: 200,
       message: "Logs obtenidos",
@@ -242,7 +320,7 @@ server.get("/getServer", async (req, res) => {
   }
 });
 
-// Middleware para manejar errores CORS explícitamente
+// ERROR CORS
 server.use((err, req, res, next) => {
   if (err.message === 'Not allowed by CORS') {
     res.status(403).json({ 
@@ -256,11 +334,10 @@ server.use((err, req, res, next) => {
   }
 });
 
-// Iniciar servidor
+// INICIAR SERVIDOR
 server.listen(PORT, () => {
   console.log(`Servidor corriendo en http://localhost:${PORT}`);
   console.log('Orígenes permitidos:', allowedOrigins);
 });
 
-// Exportar para testing
 module.exports = server;
