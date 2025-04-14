@@ -25,14 +25,14 @@ const limiter = rateLimit({
   max: 100, // Límite por IP
   standardHeaders: true, // Headers estándar (RFC 6585)
   legacyHeaders: false, // Desactiva headers obsoletos
-  skipSuccessfulRequests: false, // Cuenta todas las peticiones
+  skipSuccessfulRequests: false, // Cuenta todas las peticiones}
+  
   handler: (req, res, next) => {
     const logData = {
       timestamp: new Date().toISOString(),
       method: req.method,
       url: req.url,
       status: res.statusCode,
-      responseTime: Date.now() - startTime,
       ip: req.ip || req.headers['x-forwarded-for'] || req.connection.remoteAddress,
       userAgent: req.get('User-Agent'),
       server: 2,
